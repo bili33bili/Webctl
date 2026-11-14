@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+#
+# webctl - jalankan & kelola web server lokal dari Termux / Linux / terminal
+#
+# PERINGATAN KERAS:
+#   Fitur "selftest" di tools ini HANYA boleh dipakai ke server yang kamu
+#   jalankan sendiri lewat webctl (localhost/127.0.0.1/alamat LAN milikmu).
+#   Tools ini SENGAJA menolak target lain. Menyerang web orang lain tanpa
+#   izin adalah tindak pidana (UU ITE Pasal 30 & 32, dan hukum serupa di
+#   negara lain). Pemakaian di luar servermu sendiri adalah tanggung jawab
+#   pengguna sepenuhnya.
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+WEBCTL_HOME="${WEBCTL_HOME:-$HOME/.webctl}"
+RUN_DIR="$WEBCTL_HOME/run"
+LOG_DIR="$WEBCTL_HOME/logs"
+SITES_DIR="$WEBCTL_HOME/sites"
+PLUGIN_DIR="$WEBCTL_HOME/plugins"
+CONF_FILE="$WEBCTL_HOME/webctl.conf"
+
+mkdir -p "$RUN_DIR" "$LOG_DIR" "$SITES_DIR" "$PLUGIN_DIR"
+
+# ---------- warna ----------
+C_RESET='\033[0m'; C_G='\033[32m'; C_R='\033[31m'; C_Y='\033[33m'; C_B='\033[34m'; C_BOLD='\033[1m'
+ok()   { echo -e "${C_G}[OK]${C_RESET} $*"; }
+err()  { echo -e "${C_R}[ERROR]${C_RESET} $*" 1>&2; }
+warn() { echo -e "${C_Y}[WARN]${C_RESET} $*"; }
+info() { echo -e "${C_B}[INFO]${C_RESET} $*"; }
+
+banner() {
+  echo -e "${C_BOLD}webctl v${VERSION}${C_RESET} — web runner & lab lokal (Termux/Linux/CMD)"
+}
+
+load_conf() { if [ -f "$CONF_FILE" ]; then source "$CONF_FILE"; fi; }
+load_conf
+
+# ---------- util ----------
+is_port_free() {
+  local port="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$port" <<'PY' 2>/dev/null
+import socket, sys
+p = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(0.3)
+try:
+    s.bind(("127.0.0.1", p))
+    s.close()
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+PY
+  else
+    ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null
+  fi
+}
+
+find_free_port() {
+  local start="${1:-8000}"
+  local p="$start"
+  for _ in $(seq 1 200); do
+    if is_port_free "$p"; then echo "$p"; return 0; fi
+    p=$((p+1))
+  done
+  err "Tidak menemukan port kosong mulai dari $start"
+  return 1
+}
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//'
+}
+
+pidfile_for() { echo "$RUN_DIR/$1.pid"; }
+metafile_for() { echo "$RUN_DIR/$1.meta"; }
+logfile_for() { echo "$LOG_DIR/$1.log"; }
+
+is_loopback_or_private() {
+  # true jika host adalah localhost / 127.x / ::1 / LAN privat (10.x, 172.16-31.x, 192.168.x)
+  local h="$1"
+  case "$h" in
+    localhost|127.*|::1) return 0 ;;
+    10.*) return 0 ;;
+    192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- run ----------
+cmd_run() {
+  local target="" port="" bind="127.0.0.1" name="" daemon=1 open=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      --bind) bind="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --fg) daemon=0; shift ;;
+      --open) open=1; shift ;;
+      -h|--help) cmd_run_help; return 0 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+
+  if [ -z "$target" ]; then
+    err "Target wajib diisi: folder atau file .zip"
+    cmd_run_help
+    return 1
+  fi
+
+  local serve_dir
+  if [ -d "$target" ]; then
+    serve_dir="$(cd "$target" && pwd)"
+  elif [ -f "$target" ] && [[ "$target" == *.zip ]]; then
+    local base
+    base="$(basename "$target" .zip)"
+    if [ -z "$name" ]; then name="$base"; fi
+    serve_dir="$SITES_DIR/$(slugify "$name")-$$"
+    mkdir -p "$serve_dir"
+    info "Mengekstrak $target ke $serve_dir ..."
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -q "$target" -d "$serve_dir"
+    elif command -v python3 >/dev/null 2>&1; then
+      python3 -m zipfile -e "$target" "$serve_dir"
+    else
+      err "Butuh 'unzip' atau 'python3' untuk ekstrak zip. Install salah satu dulu."
+      return 1
+    fi
+    # kalau isi zip cuma 1 folder, masuk ke dalamnya
+    local entries
+    entries=$(find "$serve_dir" -mindepth 1 -maxdepth 1)
+    if [ "$(echo "$entries" | wc -l)" -eq 1 ] && [ -d "$entries" ]; then
+      serve_dir="$entries"
+    fi
+  else
+    err "Target tidak valid: '$target' (harus folder atau file .zip yang ada)"
+    return 1
+  fi
+
+  if [ -z "$name" ]; then name="$(basename "$serve_dir")"; fi
+  name="$(slugify "$name")"
+
+  if [ -z "$port" ]; then
+    port="$(find_free_port 8000)"
+  else
+    if ! is_port_free "$port"; then
+      err "Port $port sudah dipakai. Pakai port lain atau 'webctl stop --port $port' dulu."
+      return 1
+    fi
+  fi
+
+  local pidfile logfile metafile
+  pidfile="$(pidfile_for "$name")"
+  logfile="$(logfile_for "$name")"
+  metafile="$(metafile_for "$name")"
+
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    err "Server dengan nama '$name' sudah jalan (PID $(cat "$pidfile")). Pakai 'webctl stop $name' dulu, atau --name lain."
+    return 1
+  fi
+
+  local server_cmd=""
+  if command -v python3 >/dev/null 2>&1; then
+    server_cmd="python3 -m http.server $port --bind $bind --directory \"$serve_dir\""
+  elif command -v php >/dev/null 2>&1; then
+    server_cmd="php -S $bind:$port -t \"$serve_dir\""
+  elif command -v busybox >/dev/null 2>&1; then
+    server_cmd="busybox httpd -f -p $bind:$port -h \"$serve_dir\""
+  else
+    err "Tidak ada python3/php/busybox di sistem. Install salah satu (di Termux: pkg install python)."
+    return 1
+  fi
+
+  info "Menjalankan web: $serve_dir"
+  info "Nama: $name | Port: $port | Bind: $bind"
+
+  if [ "$daemon" -eq 1 ]; then
+    nohup bash -c "$server_cmd" >"$logfile" 2>&1 &
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+    echo "$pid" > "$pidfile"
+    cat > "$metafile" <<EOF
+name=$name
+dir=$serve_dir
+port=$port
+bind=$bind
+pid=$pid
+started_at="$(date '+%Y-%m-%d %H:%M:%S')"
+EOF
+    sleep 0.5
+    if kill -0 "$pid" 2>/dev/null; then
+      ok "Server '$name' jalan di http://$bind:$port (PID $pid)"
+      ok "Log: $logfile"
+      if [ "$open" -eq 1 ]; then open_url "http://$bind:$port"; fi
+    else
+      err "Server gagal start. Cek log: $logfile"
+      tail -n 20 "$logfile" 2>/dev/null || true
+      rm -f "$pidfile" "$metafile"
+      return 1
+    fi
+  else
+    cat > "$metafile" <<EOF
+name=$name
+dir=$serve_dir
+port=$port
+bind=$bind
+pid=foreground
+started_at="$(date '+%Y-%m-%d %H:%M:%S')"
+EOF
+    info "Jalan di foreground. Tekan Ctrl+C untuk berhenti."
+    eval "$server_cmd" 2>&1 | tee "$logfile"
+  fi
+}
+
+open_url() {
+  local url="$1"
+  if command -v termux-open-url >/dev/null 2>&1; then termux-open-url "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
+  elif command -v cmd.exe >/dev/null 2>&1; then cmd.exe /c start "" "$url" >/dev/null 2>&1 &
+  else info "Buka manual: $url"
+  fi
+}
+
+cmd_run_help() {
+  cat <<EOF
+Penggunaan:
+  webctl run <folder|file.zip> [opsi]
+
+Opsi:
+  --port <n>     Port yang dipakai (default: cari otomatis mulai 8000)
+  --bind <addr>  Alamat bind (default: 127.0.0.1)
+  --name <nama>  Nama server (dipakai untuk log/stop/status)
+  --fg           Jalankan di foreground (tidak jadi background/daemon)
+  --open         Coba buka browser otomatis setelah jalan
+
+Contoh:
+  webctl run ./myweb
+  webctl run project.zip --port 8080 --name project
+EOF
+}
+
+# ---------- list / status ----------
+cmd_list() {
+  printf "%-16s %-7s %-10s %-9s %-40s\n" "NAME" "PORT" "STATUS" "PID" "DIR"
+  shopt -s nullglob
+  for meta in "$RUN_DIR"/*.meta; do
+    source "$meta"
+    local status="stopped"
+    if [ "$pid" != "foreground" ] && kill -0 "$pid" 2>/dev/null; then
+      status="running"
+    fi
+    printf "%-16s %-7s %-10s %-9s %-40s\n" "$name" "$port" "$status" "$pid" "$dir"
+  done
+  shopt -u nullglob
+}
+
+cmd_health() {
+  local target="${1:-}"
+  shopt -s nullglob
+  local metas=("$RUN_DIR"/*.meta)
+  shopt -u nullglob
+  if [ ${#metas[@]} -eq 0 ]; then
+    warn "Tidak ada server yang tercatat."
+    return 0
+  fi
+  for meta in "${metas[@]}"; do
+    source "$meta"
+    if [ -n "$target" ] && [ "$name" != "$target" ]; then continue; fi
+    local running="DOWN"
+    if [ "$pid" != "foreground" ] && kill -0 "$pid" 2>/dev/null; then running="UP(process)"; fi
+    local http_code=""
+    if command -v curl >/dev/null 2>&1; then
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://$bind:$port/" || echo "no-response")
+    fi
+    echo "---- $name ----"
+    echo "  dir       : $dir"
+    echo "  url       : http://$bind:$port/"
+    echo "  proses    : $running (pid=$pid)"
+    echo "  http probe: ${http_code:-tidak ada curl}"
+    echo "  started_at: $started_at"
+  done
+}
+
+# ---------- log ----------
+cmd_log() {
+  local name="" follow=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --follow|-f) follow=1; shift ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    err "Pakai: webctl log <nama> [--follow]"
+    cmd_list
+    return 1
+  fi
+  local logfile; logfile="$(logfile_for "$name")"
+  if [ ! -f "$logfile" ]; then
+    err "Log untuk '$name' tidak ditemukan: $logfile"
+    return 1
+  fi
+  if [ "$follow" -eq 1 ]; then
+    tail -n 50 -f "$logfile"
+  else
+    tail -n 100 "$logfile"
+  fi
+}
+
+# ---------- stop ----------
+cmd_stop() {
+  local target="${1:-}"
+  if [ -z "$target" ] || [ "$target" = "--all" ] || [ "$target" = "all" ]; then
+    shopt -s nullglob
+    local metas=("$RUN_DIR"/*.meta)
+    shopt -u nullglob
+    if [ ${#metas[@]} -eq 0 ]; then warn "Tidak ada server yang jalan."; return 0; fi
+    for meta in "${metas[@]}"; do
+      source "$meta"
+      stop_one "$name" "$pid"
+    done
+    return 0
+  fi
+  local metafile; metafile="$(metafile_for "$target")"
+  if [ ! -f "$metafile" ]; then
+    err "Server '$target' tidak ditemukan."
+    return 1
+  fi
+  source "$metafile"
+  stop_one "$name" "$pid"
+}
+
+stop_one() {
+  local name="$1" pid="$2"
+  if [ "$pid" = "foreground" ]; then
+    warn "'$name' jalan di foreground, hentikan manual dengan Ctrl+C."
+    return 0
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 0.3
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    ok "Server '$name' (PID $pid) dihentikan."
+  else
+    warn "'$name' sudah tidak jalan."
+  fi
+  rm -f "$(pidfile_for "$name")" "$(metafile_for "$name")"
+}
+
+# ---------- selftest (hanya untuk server milik sendiri) ----------
+cmd_selftest() {
+  local target="" deep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --deep) deep=1; shift ;;
+      -h|--help) cmd_selftest_help; return 0 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+
+  if [ -z "$target" ]; then
+    err "Pakai: webctl selftest <nama-server-yang-dijalankan-webctl>"
+    cmd_list
+    return 1
+  fi
+
+  local metafile; metafile="$(metafile_for "$target")"
+  if [ ! -f "$metafile" ]; then
+    err "'$target' bukan server yang tercatat oleh webctl. Tools ini hanya boleh menguji server milikmu sendiri yang dijalankan lewat 'webctl run'."
+    return 1
+  fi
+  source "$metafile"
+
+  if ! is_loopback_or_private "$bind"; then
+    err "Target bind '$bind' bukan alamat lokal/privat. webctl MENOLAK menguji host publik/orang lain."
+    return 1
+  fi
+
+  local base="http://$bind:$port"
+  banner
+  echo
+  warn "Selftest hanya menguji server LOKAL milikmu ($base). Jangan arahkan ke domain/orang lain."
+  echo
+  echo "== 1. Cek server hidup =="
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -o /dev/null -w "  status: %{http_code}, waktu: %{time_total}s\n" --max-time 3 "$base/" || warn "Tidak merespons"
+  fi
+
+  echo "== 2. Header keamanan dasar =="
+  if command -v curl >/dev/null 2>&1; then
+    local headers
+    headers=$(curl -sI --max-time 3 "$base/" || true)
+    check_header() {
+      local h="$1"
+      if echo "$headers" | grep -qi "^$h:"; then
+        ok "  $h ada"
+      else
+        warn "  $h TIDAK ada (pertimbangkan tambahkan di server produksi)"
+      fi
+    }
+    check_header "X-Content-Type-Options"
+    check_header "X-Frame-Options"
+    check_header "Content-Security-Policy"
+    check_header "Strict-Transport-Security"
+  fi
+
+  echo "== 3. Directory listing / file sensitif =="
+  for f in ".env" ".git/config" "config.php" "wp-config.php" "id_rsa"; do
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$base/$f" 2>/dev/null || echo "000")
+    if [ "$code" = "200" ]; then
+      warn "  $f TERBUKA (HTTP 200) — jangan commit/paparkan file ini"
+    fi
+  done
+
+  echo "== 4. Basic load test (ringan, lokal saja) =="
+  if command -v curl >/dev/null 2>&1; then
+    local n=20 start end
+    if [ "$deep" -eq 1 ]; then n=100; fi
+    start=$(date +%s%N)
+    for _ in $(seq 1 "$n"); do
+      curl -s -o /dev/null --max-time 2 "$base/" &
+    done
+    wait
+    end=$(date +%s%N)
+    local ms=$(( (end - start) / 1000000 ))
+    ok "  $n request paralel selesai dalam ${ms}ms"
+  fi
+
+  echo
+  ok "Selftest selesai. Ini bukan pengganti audit keamanan profesional."
+}
+
+cmd_selftest_help() {
+  cat <<EOF
+Penggunaan:
+  webctl selftest <nama-server> [--deep]
+
+Hanya bisa dipakai untuk server yang kamu jalankan sendiri lewat
+'webctl run' (dicek dari file meta webctl). Tidak bisa dipakai ke
+domain/IP publik orang lain.
+EOF
+}
+
+# ---------- plugin ----------
+cmd_plugin() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list)
+      shopt -s nullglob
+      local found=0
+      for f in "$PLUGIN_DIR"/*.sh; do
+        found=1
+        echo " - $(basename "$f" .sh)"
+      done
+      shopt -u nullglob
+      if [ "$found" -eq 0 ]; then info "Belum ada plugin terpasang. Taruh file .sh di $PLUGIN_DIR"; fi
+      ;;
+    install)
+      local src="${1:-}"
+      if [ -z "$src" ]; then err "Pakai: webctl plugin install <file.sh>"; return 1; fi
+      if [ ! -f "$src" ]; then err "File plugin tidak ditemukan: $src"; return 1; fi
+      cp "$src" "$PLUGIN_DIR/"
+      ok "Plugin $(basename "$src") terpasang."
+      ;;
+    run)
+      local pname="${1:-}"; shift || true
+      local pfile="$PLUGIN_DIR/$pname.sh"
+      if [ ! -f "$pfile" ]; then err "Plugin '$pname' tidak ditemukan."; return 1; fi
+      bash "$pfile" "$@"
+      ;;
+    *)
+      cat <<EOF
+Penggunaan:
+  webctl plugin list
+  webctl plugin install <file.sh>
+  webctl plugin run <nama> [args...]
+EOF
+      ;;
+  esac
+}
+
+# ---------- help ----------
+cmd_help() {
+  banner
+  cat <<EOF
+
+Penggunaan:
+  webctl run <folder|zip> [opsi]     Jalankan web dari folder atau file zip
+  webctl list                        Daftar server yang tercatat
+  webctl health [nama]               Cek kesehatan server (proses + HTTP)
+  webctl log <nama> [--follow]       Lihat log server
+  webctl stop <nama|all>             Matikan server
+  webctl selftest <nama> [--deep]    Uji keamanan dasar ke SERVER SENDIRI saja
+  webctl plugin list|install|run     Kelola plugin tambahan
+  webctl version                     Versi tools
+  webctl help                        Bantuan ini
+
+Contoh cepat:
+  webctl run ./situs-saya --port 8080 --name situs
+  webctl log situs --follow
+  webctl selftest situs
+  webctl stop situs
+
+PERINGATAN:
+  'selftest' hanya bekerja ke server yang kamu jalankan sendiri lewat
+  webctl (localhost/LAN). Dilarang dipakai untuk menyerang web/server
+  milik orang lain tanpa izin — itu melanggar hukum.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    run) cmd_run "$@" ;;
+    list|ls|status) cmd_list "$@" ;;
+    health) cmd_health "$@" ;;
+    log|logs) cmd_log "$@" ;;
+    stop|kill) cmd_stop "$@" ;;
+    selftest|test-attack|hacktest) cmd_selftest "$@" ;;
+    plugin|plugins) cmd_plugin "$@" ;;
+    version|-v|--version) echo "webctl v$VERSION" ;;
+    help|-h|--help) cmd_help ;;
+    *) err "Perintah tidak dikenal: $cmd"; echo; cmd_help; return 1 ;;
+  esac
+}
+
+main "$@"
