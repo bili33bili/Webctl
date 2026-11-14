@@ -51,7 +51,7 @@ cek cepat sebelum kamu publish web sendiri.
 ### Termux (Android)
 ```bash
 pkg update && pkg install -y python git curl unzip
-git clone https://github.com/<user>/webctl.git
+git clone https://github.com/bili33bili/webctl.git
 cd webctl
 bash install.sh
 source ~/.bashrc   # atau buka sesi Termux baru
@@ -61,7 +61,7 @@ webctl help
 ### Linux / WSL
 ```bash
 sudo apt update && sudo apt install -y python3 curl unzip   # Debian/Ubuntu
-git clone https://github.com/<user>/webctl.git
+git clone https://github.com/bili33bili/webctl.git
 cd webctl
 bash install.sh
 source ~/.bashrc
@@ -70,14 +70,12 @@ webctl help
 
 ### Install langsung (1 baris, setelah repo di-publish ke GitHub)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<user>/webctl/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/bili33bili/webctl/main/install.sh | bash
 ```
 
 ### Windows (CMD/PowerShell)
 Pakai WSL (disarankan) lalu ikuti langkah Linux di atas, atau jalankan
 lewat Git Bash yang sudah include `bash`.
-
-> Ganti `<user>` di atas dengan username GitHub kamu setelah repo dipublish.
 
 ---
 
